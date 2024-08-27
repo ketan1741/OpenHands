@@ -86,7 +86,7 @@ class CodeActAgent(Agent):
         self.prompt_manager = PromptManager(
             prompt_dir=os.path.join(os.path.dirname(__file__)),
             agent_skills_docs=AgentSkillsRequirement.documentation,
-            micro_agent_name=self.micro_agent,  # TODO: implement micro-agent
+            micro_agent=self.micro_agent,  # TODO: implement micro-agent
         )
 
     def action_to_str(self, action: Action) -> str:
