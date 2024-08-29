@@ -60,4 +60,5 @@ class PromptManager:
         rendered = self.user_template.render(
             micro_agent=self.micro_agent.content if self.micro_agent else None
         )
+        print(rendered.strip())
         return rendered.strip()

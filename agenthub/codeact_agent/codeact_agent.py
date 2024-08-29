@@ -88,6 +88,7 @@ class CodeActAgent(Agent):
             agent_skills_docs=AgentSkillsRequirement.documentation,
             micro_agent=self.micro_agent,  # TODO: implement micro-agent
         )
+        print(self.prompt_manager.system_message)
 
     def action_to_str(self, action: Action) -> str:
         if isinstance(action, CmdRunAction):
