@@ -14,7 +14,7 @@ from pathspec.patterns import GitWildMatchPattern
 from openhands.security.options import SecurityAnalyzers
 from openhands.server.data_models.feedback import FeedbackDataModel, store_feedback
 from openhands.storage import get_file_store
-from openhands.utils.async_utils import sync_from_async
+from openhands.utils.async_utils import call_sync_from_async
 
 with warnings.catch_warnings():
     warnings.simplefilter('ignore')
@@ -34,6 +34,7 @@ from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.security import HTTPBearer
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
 
 import openhands.agenthub  # noqa F401 (we import this to get the agents registered)
 from openhands.controller.agent import Agent
@@ -54,7 +55,7 @@ from openhands.events.observation import (
 )
 from openhands.events.serialization import event_to_dict
 from openhands.llm import bedrock
-from openhands.runtime.runtime import Runtime
+from openhands.runtime.base import Runtime
 from openhands.server.auth import get_sid_from_token, sign_token
 from openhands.server.session import SessionManager
 
@@ -63,6 +64,9 @@ load_dotenv()
 config = load_app_config()
 file_store = get_file_store(config.file_store, config.file_store_path)
 session_manager = SessionManager(config, file_store)
+
+GITHUB_CLIENT_ID = os.getenv('GITHUB_CLIENT_ID', '').strip()
+GITHUB_CLIENT_SECRET = os.getenv('GITHUB_CLIENT_SECRET', '').strip()
 
 
 @asynccontextmanager
@@ -80,6 +84,25 @@ app.add_middleware(
     allow_methods=['*'],
     allow_headers=['*'],
 )
+
+
+class NoCacheMiddleware(BaseHTTPMiddleware):
+    """
+    Middleware to disable caching for all routes by adding appropriate headers
+    """
+
+    async def dispatch(self, request, call_next):
+        response = await call_next(request)
+        if not request.url.path.startswith('/assets'):
+            response.headers['Cache-Control'] = (
+                'no-cache, no-store, must-revalidate, max-age=0'
+            )
+            response.headers['Pragma'] = 'no-cache'
+            response.headers['Expires'] = '0'
+        return response
+
+
+app.add_middleware(NoCacheMiddleware)
 
 security_scheme = HTTPBearer()
 
@@ -180,9 +203,14 @@ async def attach_session(request: Request, call_next):
     Returns:
         Response: The response from the next middleware or route handler.
     """
-    if request.url.path.startswith('/api/options/') or not request.url.path.startswith(
-        '/api/'
-    ):
+    non_authed_paths = [
+        '/api/options/',
+        '/api/github/callback',
+        '/api/authenticate',
+    ]
+    if any(
+        request.url.path.startswith(path) for path in non_authed_paths
+    ) or not request.url.path.startswith('/api/'):
         response = await call_next(request)
         return response
 
@@ -211,7 +239,7 @@ async def attach_session(request: Request, call_next):
             content={'error': 'Invalid token'},
         )
 
-    request.state.conversation = session_manager.attach_to_conversation(
+    request.state.conversation = await session_manager.attach_to_conversation(
         request.state.sid
     )
     if request.state.conversation is None:
@@ -219,8 +247,10 @@ async def attach_session(request: Request, call_next):
             status_code=status.HTTP_404_NOT_FOUND,
             content={'error': 'Session not found'},
         )
-
-    response = await call_next(request)
+    try:
+        response = await call_next(request)
+    finally:
+        await session_manager.detach_from_conversation(request.state.conversation)
     return response
 
 
@@ -254,7 +284,7 @@ async def websocket_endpoint(websocket: WebSocket):
         ```
     - Run a command:
         ```json
-        {"action": "run", "args": {"command": "ls -l", "thought": "", "is_confirmed": "confirmed"}}
+        {"action": "run", "args": {"command": "ls -l", "thought": "", "confirmation_state": "confirmed"}}
         ```
     - Run an IPython command:
         ```json
@@ -441,7 +471,9 @@ async def list_files(request: Request, path: str | None = None):
         )
 
     runtime: Runtime = request.state.conversation.runtime
-    file_list = await sync_from_async(runtime.list_files, path)
+    file_list = await asyncio.create_task(
+        call_sync_from_async(runtime.list_files, path)
+    )
     if path:
         file_list = [os.path.join(path, f) for f in file_list]
 
@@ -490,7 +522,7 @@ async def select_file(file: str, request: Request):
 
     file = os.path.join(runtime.config.workspace_mount_path_in_sandbox, file)
     read_action = FileReadAction(file)
-    observation = await sync_from_async(runtime.run_action, read_action)
+    observation = await call_sync_from_async(runtime.run_action, read_action)
 
     if isinstance(observation, FileReadObservation):
         content = observation.content
@@ -687,7 +719,7 @@ async def save_file(request: Request):
             runtime.config.workspace_mount_path_in_sandbox, file_path
         )
         write_action = FileWriteAction(file_path, content)
-        observation = await sync_from_async(runtime.run_action, write_action)
+        observation = await call_sync_from_async(runtime.run_action, write_action)
 
         if isinstance(observation, FileWriteObservation):
             return JSONResponse(
@@ -739,7 +771,7 @@ async def zip_current_workspace(request: Request):
         runtime: Runtime = request.state.conversation.runtime
 
         path = runtime.config.workspace_mount_path_in_sandbox
-        zip_file_bytes = runtime.copy_from(path)
+        zip_file_bytes = await call_sync_from_async(runtime.copy_from, path)
         zip_stream = io.BytesIO(zip_file_bytes)  # Wrap to behave like a file stream
         response = StreamingResponse(
             zip_stream,
@@ -760,16 +792,16 @@ class AuthCode(BaseModel):
     code: str
 
 
-@app.post('/github/callback')
+@app.post('/api/github/callback')
 def github_callback(auth_code: AuthCode):
     # Prepare data for the token exchange request
     data = {
-        'client_id': os.getenv('GITHUB_CLIENT_ID'),
-        'client_secret': os.getenv('GITHUB_CLIENT_SECRET'),
+        'client_id': GITHUB_CLIENT_ID,
+        'client_secret': GITHUB_CLIENT_SECRET,
         'code': auth_code.code,
     }
 
-    logger.info(f'Exchanging code for token: {data}')
+    logger.info('Exchanging code for GitHub token')
 
     headers = {'Accept': 'application/json'}
     response = requests.post(
@@ -777,6 +809,7 @@ def github_callback(auth_code: AuthCode):
     )
 
     if response.status_code != 200:
+        logger.error(f'Failed to exchange code for token: {response.text}')
         return JSONResponse(
             status_code=status.HTTP_400_BAD_REQUEST,
             content={'error': 'Failed to exchange code for token'},
@@ -796,4 +829,42 @@ def github_callback(auth_code: AuthCode):
     )
 
 
-app.mount('/', StaticFiles(directory='./frontend/build', html=True), name='dist')
+class User(BaseModel):
+    login: str  # GitHub login handle
+
+
+@app.post('/api/authenticate')
+def authenticate(user: User | None = None):
+    waitlist = os.getenv('GITHUB_USER_LIST_FILE')
+
+    # Only check if waitlist is provided
+    if waitlist is not None:
+        try:
+            with open(waitlist, 'r') as f:
+                users = f.read().splitlines()
+                if user is None or user.login not in users:
+                    return JSONResponse(
+                        status_code=status.HTTP_403_FORBIDDEN,
+                        content={'error': 'User not on waitlist'},
+                    )
+        except FileNotFoundError:
+            return JSONResponse(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                content={'error': 'Waitlist file not found'},
+            )
+
+    return JSONResponse(
+        status_code=status.HTTP_200_OK, content={'message': 'User authenticated'}
+    )
+
+
+class SPAStaticFiles(StaticFiles):
+    async def get_response(self, path: str, scope):
+        try:
+            return await super().get_response(path, scope)
+        except Exception:
+            # FIXME: just making this HTTPException doesn't work for some reason
+            return await super().get_response('index.html', scope)
+
+
+app.mount('/', SPAStaticFiles(directory='./frontend/build', html=True), name='dist')
