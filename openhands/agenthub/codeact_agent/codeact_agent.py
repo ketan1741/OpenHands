@@ -378,6 +378,7 @@ class CodeActAgent(Agent):
         params['tools'] = self.tools
         if self.mock_function_calling:
             params['mock_function_calling'] = True
+        print(json.dumps(params['messages'], indent=2))
         response = self.llm.completion(**params)
         actions = codeact_function_calling.response_to_actions(response)
         for action in actions:
